@@ -1,0 +1,12 @@
+Fix stale executor success after defer when TI lands in queued state
+
+Extended the ``ti_requeued`` branch in ``process_executor_events`` to also
+cover the case where the trigger reschedules a deferred task into ``QUEUED``
+(rather than ``SCHEDULED``) before the scheduler processes the stale executor
+``SUCCESS`` from the worker's defer exit. This prevents the scheduler from
+treating the state mismatch as an external kill and failing the task.
+
+Previously only the ``SCHEDULED`` variant was handled (#66431 / #66374).
+Under load the trigger may reschedule into either ``QUEUED`` or ``SCHEDULED``
+depending on scheduler loop timing, so both states must be treated as stale
+defer-exit events when ``next_method`` is set.
