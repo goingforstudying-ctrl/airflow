@@ -834,6 +834,108 @@ def test_active_dag_run(dag_maker, session):
         )
 
 
+@pytest.mark.backend("postgres", "mysql")
+def test_concurrent_backfill_creation_allows_only_one_winner(dag_maker, session):
+    """Two racing _create_backfill calls for the same dag must not both succeed."""
+    import threading
+
+    import airflow.models.backfill as backfill_module
+
+    with dag_maker(schedule="@daily") as dag:
+        PythonOperator(task_id="hi", python_callable=print)
+    session.commit()
+
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    gate_lock = threading.Lock()
+    first_pending = True
+    results = []
+
+    original_get_info_list = backfill_module._get_info_list
+
+    def gated_get_info_list(*args, **kwargs):
+        nonlocal first_pending
+        with gate_lock:
+            should_wait = first_pending
+            if should_wait:
+                first_pending = False
+        if should_wait:
+            first_entered.set()
+            assert release_first.wait(timeout=10)
+        return original_get_info_list(*args, **kwargs)
+
+    def create_backfill():
+        try:
+            results.append(
+                _create_backfill(
+                    dag_id=dag.dag_id,
+                    from_date=pendulum.parse("2021-01-01"),
+                    to_date=pendulum.parse("2021-01-05"),
+                    max_active_runs=10,
+                    reverse=False,
+                    triggering_user_name="pytest",
+                    dag_run_conf={"this": "param"},
+                )
+            )
+        except Exception as exc:
+            results.append(exc)
+
+    with mock.patch.object(backfill_module, "_get_info_list", side_effect=gated_get_info_list):
+        t1 = threading.Thread(target=create_backfill)
+        t2 = threading.Thread(target=create_backfill)
+        t1.start()
+        assert first_entered.wait(timeout=10)
+        t2.start()
+        release_first.set()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+    assert not t1.is_alive()
+    assert not t2.is_alive()
+
+    successes = [r for r in results if isinstance(r, Backfill)]
+    failures = [r for r in results if isinstance(r, Exception)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], AlreadyRunningBackfill)
+
+    session.expire_all()
+    assert (
+        session.scalar(
+            select(func.count()).where(Backfill.dag_id == dag.dag_id, Backfill.completed_at.is_(None))
+        )
+        == 1
+    )
+
+
+def test_failed_backfill_creation_leaves_no_visible_partial_state(dag_maker, session):
+    """If run creation raises, no committed Backfill row should be visible afterwards."""
+    with dag_maker(schedule="@daily") as dag:
+        PythonOperator(task_id="hi", python_callable=print)
+    session.commit()
+
+    with mock.patch(
+        "airflow.models.backfill._create_runs_non_partitioned",
+        side_effect=RuntimeError("simulated failure mid-creation"),
+    ):
+        with pytest.raises(RuntimeError, match="simulated failure mid-creation"):
+            _create_backfill(
+                dag_id=dag.dag_id,
+                from_date=pendulum.parse("2021-01-01"),
+                to_date=pendulum.parse("2021-01-05"),
+                max_active_runs=10,
+                reverse=False,
+                triggering_user_name="pytest",
+                dag_run_conf=None,
+            )
+
+    session.expire_all()
+    # The whole create ran in one transaction; the RuntimeError rolled it back,
+    # so neither a Backfill row nor any DagRun rows may remain.
+    assert session.scalar(select(func.count()).where(Backfill.dag_id == dag.dag_id)) == 0
+    assert session.scalar(select(func.count()).where(DagRun.dag_id == dag.dag_id)) == 0
+
+
 def create_next_run(
     *, is_backfill: bool, next_date: datetime, dag_id: str, dag_maker, reprocess=None, session: Session
 ):

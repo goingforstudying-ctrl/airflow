@@ -682,7 +682,13 @@ def _create_backfill(
         if not serdag:
             raise DagNotFound(f"Could not find dag {dag_id}")
 
-        dag_model = session.scalar(select(DagModel).where(DagModel.dag_id == dag_id).limit(1))
+        dag_model = session.scalar(
+            with_row_locks(
+                select(DagModel).where(DagModel.dag_id == dag_id).limit(1),
+                of=DagModel,
+                session=session,
+            )
+        )
         if dag_model:
             if (
                 dag_model.allowed_run_types is not None
@@ -741,12 +747,10 @@ def _create_backfill(
             triggering_user_name=triggering_user_name,
         )
         session.add(backfill)
-        # Commit immediately so the backfill is visible to concurrent requests
-        # checking num_active backfills, preventing duplicate active backfills
-        # for the same dag.
-        session.commit()
-
-        session.scalars(select(DagModel).where(DagModel.dag_id == dag_id)).one()
+        # Flush, not commit: the DagModel row lock above serialises concurrent
+        # creates for this dag, and one transaction keeps the Backfill row
+        # invisible until its DagRuns exist too (see #64534).
+        session.flush()
 
         first_info = dagrun_info_list[0]
         try:
